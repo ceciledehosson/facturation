@@ -82,7 +82,7 @@ def enregistrer_facture_apps_script(data_facture, lignes, pdf_filename):
             "payment_terms": data_facture["mode_paiement"],
             "notes": "",
             "pdf_filename": pdf_filename,
-            "line_items": lignes
+            "line_items": " | ".join([ligne["description"] for ligne in lignes])
         }
 
         response = requests.post(
