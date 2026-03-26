@@ -1,3 +1,7 @@
 streamlit
 reportlab
 requests
+pandas
+gspread
+google-auth
+google-auth-oauthlib
