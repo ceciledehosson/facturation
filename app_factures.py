@@ -152,7 +152,7 @@ def generer_pdf_facture(data_facture, lignes):
                 width=55 * mm,
                 height=30 * mm,
                 preserveAspectRatio=True,
-                mask='auto'
+                mask='auto',
                 anchor='sw'
             )
         except Exception:
