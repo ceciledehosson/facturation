@@ -1,12 +1,11 @@
 import os
 import io
-import math
+import json
+import requests
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
@@ -27,13 +26,12 @@ EMETTEUR_SIRET = "92538207900018"
 TAUX_TVA = 0.20  # 20%
 
 # --- Logo ---
-# Mets ici le nom exact du fichier logo présent dans le même dossier que l'app
 LOGO_PATH = "logo.png"
 
-# --- Google Sheets ---
-# Mets ici le nom exact de ton Google Sheet et de l'onglet
-GOOGLE_SHEET_NAME = "Registre_factures_LK"
-GOOGLE_WORKSHEET_NAME = "factures"
+# --- Apps Script ---
+# Mets l'URL de ta web app Apps Script dans les secrets Streamlit
+# Exemple dans secrets.toml :
+# APPS_SCRIPT_URL = "https://script.google.com/macros/s/XXXXXXXX/exec"
 
 # ============================================================
 # OUTILS
@@ -54,7 +52,7 @@ def ht_to_ttc(prix_ht, taux_tva=TAUX_TVA):
 def format_euro(x):
     return f"{x:,.2f} €".replace(",", " ").replace(".", ",")
 
-def generer_numero_facture():
+def generer_numero_facture_local():
     if "compteur_facture" not in st.session_state:
         st.session_state.compteur_facture = 1
     numero = f"LK-{datetime.now().strftime('%Y%m%d')}-{st.session_state.compteur_facture:03d}"
@@ -66,69 +64,46 @@ def incrementer_numero_facture():
     st.session_state.compteur_facture += 1
 
 # ============================================================
-# GOOGLE SHEETS
+# APPS SCRIPT
 # ============================================================
 
-@st.cache_resource
-def connexion_gsheet():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+def enregistrer_facture_apps_script(data_facture, lignes, pdf_filename):
+    try:
+        if "APPS_SCRIPT_URL" not in st.secrets:
+            return False, "La clé APPS_SCRIPT_URL est absente de st.secrets.", None
 
-    if "gcp_service_account" not in st.secrets:
-        raise ValueError(
-            "La clé 'gcp_service_account' est absente de st.secrets. "
-            "Ajoute tes identifiants de service Google dans les secrets Streamlit."
+        payload = {
+            "invoice_date": data_facture["date_facture"],
+            "client_name": data_facture["client_nom"],
+            "client_address": data_facture["client_adresse"],
+            "total_ht": data_facture["total_ht"],
+            "total_tva": data_facture["total_tva"],
+            "total_ttc": data_facture["total_ttc"],
+            "payment_terms": data_facture["mode_paiement"],
+            "notes": "",
+            "pdf_filename": pdf_filename,
+            "line_items": lignes
+        }
+
+        response = requests.post(
+            st.secrets["APPS_SCRIPT_URL"],
+            json=payload,
+            timeout=30
         )
 
-    credentials = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=scopes
-    )
-    client = gspread.authorize(credentials)
-    return client
+        if response.status_code != 200:
+            return False, f"Erreur Apps Script ({response.status_code}) : {response.text}", None
 
-def enregistrer_facture_gsheet(data_facture, lignes):
-    try:
-        client = connexion_gsheet()
-        sheet = client.open(GOOGLE_SHEET_NAME)
-        worksheet = sheet.worksheet(GOOGLE_WORKSHEET_NAME)
+        result = response.json()
 
-        date_facture = data_facture["date_facture"]
-        numero_facture = data_facture["numero_facture"]
-        client_nom = data_facture["client_nom"]
-        client_adresse = data_facture["client_adresse"]
-        total_ht = data_facture["total_ht"]
-        total_tva = data_facture["total_tva"]
-        total_ttc = data_facture["total_ttc"]
-        mode_paiement = data_facture["mode_paiement"]
+        if not result.get("success", True):
+            return False, f"Erreur Apps Script : {result.get('error', 'erreur inconnue')}", None
 
-        for ligne in lignes:
-            worksheet.append_row([
-                date_facture,
-                numero_facture,
-                client_nom,
-                client_adresse,
-                ligne["description"],
-                ligne["quantite"],
-                ligne["prix_unitaire_ttc"],
-                ligne["prix_unitaire_ht"],
-                ligne["montant_ht"],
-                ligne["montant_tva"],
-                ligne["montant_ttc"],
-                total_ht,
-                total_tva,
-                total_ttc,
-                mode_paiement,
-                EMETTEUR_NOM,
-                EMETTEUR_ADRESSE,
-                EMETTEUR_SIRET,
-            ])
+        invoice_number = result.get("invoice_number")
+        return True, "Facture enregistrée dans Google Sheets via Apps Script.", invoice_number
 
-        return True, "Facture enregistrée dans Google Sheets."
     except Exception as e:
-        return False, f"Erreur Google Sheets : {e}"
+        return False, f"Erreur Apps Script : {e}", None
 
 # ============================================================
 # PDF
@@ -148,6 +123,7 @@ def dessiner_texte_multiligne(c, texte, x, y, largeur_max, leading=12, font_name
             if ligne_courante:
                 lignes.append(ligne_courante)
             ligne_courante = mot
+
     if ligne_courante:
         lignes.append(ligne_courante)
 
@@ -165,11 +141,19 @@ def generer_pdf_facture(data_facture, lignes):
     marge_droite = 20 * mm
     y = height - 20 * mm
 
-    # --- Logo automatique ---
+    # --- Logo automatique agrandi ---
     if os.path.exists(LOGO_PATH):
         try:
             logo = ImageReader(LOGO_PATH)
-            c.drawImage(logo, marge_gauche, y - 25 * mm, width=35 * mm, height=20 * mm, preserveAspectRatio=True, mask='auto')
+            c.drawImage(
+                logo,
+                marge_gauche,
+                y - 30 * mm,
+                width=55 * mm,
+                height=30 * mm,
+                preserveAspectRatio=True,
+                mask='auto'
+            )
         except Exception:
             pass
 
@@ -182,7 +166,7 @@ def generer_pdf_facture(data_facture, lignes):
     c.drawRightString(width - marge_droite, y - 11 * mm, f"SIRET : {EMETTEUR_SIRET}")
 
     # --- Titre facture ---
-    y -= 35 * mm
+    y -= 40 * mm
     c.setFont("Helvetica-Bold", 18)
     c.drawString(marge_gauche, y, "FACTURE")
 
@@ -197,8 +181,14 @@ def generer_pdf_facture(data_facture, lignes):
 
     c.setFont("Helvetica", 11)
     y_client = y - 7 * mm
-    y_client = dessiner_texte_multiligne(c, data_facture["client_nom"], marge_gauche, y_client, 80 * mm, leading=12, font_name="Helvetica-Bold", font_size=11)
-    y_client = dessiner_texte_multiligne(c, data_facture["client_adresse"], marge_gauche, y_client, 80 * mm, leading=12, font_name="Helvetica", font_size=10)
+    y_client = dessiner_texte_multiligne(
+        c, data_facture["client_nom"], marge_gauche, y_client, 80 * mm,
+        leading=12, font_name="Helvetica-Bold", font_size=11
+    )
+    y_client = dessiner_texte_multiligne(
+        c, data_facture["client_adresse"], marge_gauche, y_client, 80 * mm,
+        leading=12, font_name="Helvetica", font_size=10
+    )
 
     # --- Tableau lignes ---
     y_table = y - 25 * mm
@@ -239,7 +229,7 @@ def generer_pdf_facture(data_facture, lignes):
     c.drawString(120 * mm, y_totaux, "Total HT")
     c.drawRightString(width - marge_droite, y_totaux, format_euro(data_facture["total_ht"]))
 
-    c.drawString(120 * mm, y_totaux - 7 * mm, f"TVA ({int(TAUX_TVA*100)}%)")
+    c.drawString(120 * mm, y_totaux - 7 * mm, f"TVA ({int(TAUX_TVA * 100)}%)")
     c.drawRightString(width - marge_droite, y_totaux - 7 * mm, format_euro(data_facture["total_tva"]))
 
     c.setFont("Helvetica-Bold", 12)
@@ -260,13 +250,16 @@ def generer_pdf_facture(data_facture, lignes):
 
 st.title("Facturation – L'Atelier Kez'ya")
 
-st.markdown("Remplis les informations client et les lignes de facture. Le logo, l’adresse émetteur et le SIRET sont intégrés automatiquement.")
+st.markdown(
+    "Remplis les informations client et les lignes de facture. "
+    "Le logo, l’adresse émetteur et le SIRET sont intégrés automatiquement."
+)
 
 with st.form("form_facture"):
     col1, col2 = st.columns(2)
 
     with col1:
-        numero_facture = st.text_input("Numéro de facture", value=generer_numero_facture())
+        numero_facture = st.text_input("Numéro de facture", value=generer_numero_facture_local())
         date_facture = st.date_input("Date de facture", value=datetime.today())
         client_nom = st.text_input("Nom / raison sociale du client")
         client_adresse = st.text_area("Adresse du client", height=100)
@@ -382,9 +375,19 @@ if submitted:
         colB.metric("TVA", format_euro(total_tva))
         colC.metric("Total TTC", format_euro(total_ttc))
 
-        pdf_buffer = generer_pdf_facture(data_facture, lignes_calculees)
+        # Enregistrement dans Apps Script pour récupérer le vrai numéro LK-AAAA-XXX
+        nom_fichier_temp = f"facture_{numero_facture}.pdf"
+        ok, message, invoice_number_from_sheet = enregistrer_facture_apps_script(
+            data_facture,
+            lignes_calculees,
+            nom_fichier_temp
+        )
 
-        nom_fichier = f"facture_{numero_facture}.pdf"
+        if ok and invoice_number_from_sheet:
+            data_facture["numero_facture"] = invoice_number_from_sheet
+
+        pdf_buffer = generer_pdf_facture(data_facture, lignes_calculees)
+        nom_fichier = f"facture_{data_facture['numero_facture']}.pdf"
 
         st.download_button(
             label="Télécharger le PDF",
@@ -393,7 +396,6 @@ if submitted:
             mime="application/pdf"
         )
 
-        ok, message = enregistrer_facture_gsheet(data_facture, lignes_calculees)
         if ok:
             st.success(message)
             incrementer_numero_facture()
