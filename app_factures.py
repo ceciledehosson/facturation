@@ -1,271 +1,468 @@
-import streamlit as st
-from datetime import datetime
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-import os
-import pandas as pd
+import io
+from datetime import datetime, date
+from decimal import Decimal, ROUND_HALF_UP
 
-st.title("Facturation - L'Atelier Kez'ya")
+import requests
+import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
 
 # =========================
 # CONFIG
 # =========================
-EMETTEUR_NOM = "L'Atelier Kez'ya"
-EMETTEUR_ADRESSE = "7 rue Pasteur, 89700 Tonnerre"
-EMETTEUR_SIRET = "92538207900018"
-LOGO_PATH = "logo_kezya.png"
+st.set_page_config(page_title="Facturation L'Atelier Kez'ya", layout="wide")
 
-DOSSIER_FACTURES = "factures"
-os.makedirs(DOSSIER_FACTURES, exist_ok=True)
+DEFAULT_SELLER_NAME = "L'Atelier Kez'ya"
+DEFAULT_SELLER_ADDRESS = ""
+DEFAULT_SELLER_SIRET = ""
+DEFAULT_TVA_RATE = 20.0  # en %
 
-# =========================
-# NUMÉROTATION AUTOMATIQUE
-# =========================
-def get_next_invoice_number():
-    fichiers = os.listdir(DOSSIER_FACTURES)
-    numeros = []
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx8FiyF-eVCtd3PA246BIhSTj5oAdUREYVupZcUeorCdseSkhs6-5QKuaaWuB4liMTLUg/exec"
 
-    for f in fichiers:
-        if f.startswith("facture_LK_") and f.endswith(".pdf"):
-            try:
-                num = int(f.split("_")[-1].replace(".pdf", ""))
-                numeros.append(num)
-            except:
-                pass
-
-    return max(numeros, default=0) + 1
 
 # =========================
-# CLIENT
+# OUTILS
 # =========================
-st.header("Client")
-nom_client = st.text_input("Nom du client")
-adresse_client = st.text_area("Adresse du client")
+def q2(value):
+    """Arrondi à 2 décimales façon comptable."""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
-# =========================
-# INFOS FACTURE
-# =========================
-st.header("Facture")
-date_facture = st.date_input("Date", datetime.today())
 
-# =========================
-# LIGNES DE FACTURE
-# =========================
-st.subheader("Lignes de facture")
+def euro(value):
+    return f"{q2(value):.2f} €"
 
-df_initial = pd.DataFrame(
-    [
-        {
-            "Description": "",
-            "Quantité": 1,
-            "PU TTC": 0.0,
-            "TVA (%)": 0.0
-        }
-    ]
-)
 
-lignes = st.data_editor(
-    df_initial,
-    num_rows="dynamic",
-    use_container_width=True,
-    key="table_facture"
-)
+def safe_filename(invoice_number):
+    cleaned = invoice_number.replace("/", "-").replace(" ", "_")
+    return f"facture_LK_{cleaned}.pdf"
 
-# Nettoyage et calculs
-lignes_calculees = []
-total_ht_general = 0.0
-total_tva_general = 0.0
-total_ttc_general = 0.0
 
-for _, row in lignes.iterrows():
-    description = str(row["Description"]).strip()
-    quantite = row["Quantité"]
-    pu_ttc = row["PU TTC"]
-    tva = row["TVA (%)"]
+def compute_line_totals(qty, unit_ttc, tva_rate):
+    qty_d = Decimal(str(qty))
+    unit_ttc_d = Decimal(str(unit_ttc))
+    tva_rate_d = Decimal(str(tva_rate))
 
-    if description == "" and pu_ttc == 0 and quantite == 1 and tva == 0:
-        continue
+    divisor = Decimal("1") + (tva_rate_d / Decimal("100"))
+    unit_ht = (unit_ttc_d / divisor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total_ttc = (qty_d * unit_ttc_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total_ht = (qty_d * unit_ht).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    total_tva = (total_ttc - total_ht).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    try:
-        quantite = float(quantite)
-        pu_ttc = float(pu_ttc)
-        tva = float(tva)
-    except:
-        continue
+    return {
+        "unit_ht": float(unit_ht),
+        "total_ht": float(total_ht),
+        "total_tva": float(total_tva),
+        "total_ttc": float(total_ttc),
+    }
 
-    if tva == 0:
-        pu_ht = pu_ttc
-    else:
-        pu_ht = pu_ttc / (1 + tva / 100)
 
-    total_ht_ligne = quantite * pu_ht
-    total_ttc_ligne = quantite * pu_ttc
-    montant_tva_ligne = total_ttc_ligne - total_ht_ligne
+def get_invoice_number_and_save(data, line_items, totals, filename):
+    payload = {
+        "invoice_date": data["invoice_date"],
+        "client_name": data["client_name"],
+        "total_ht": totals["total_ht"],
+        "total_tva": totals["total_tva"],
+        "total_ttc": totals["total_ttc"],
+        "payment_terms": data["payment_terms"],
+        "notes": data["notes"],
+        "pdf_filename": filename,
+        "line_items": " | ".join(
+            [
+                f"{item['description']} x{item['qty']} @ {item['unit_ttc']:.2f} TTC"
+                for item in line_items
+            ]
+        ),
+    }
 
-    lignes_calculees.append(
-        {
-            "Description": description,
-            "Quantité": quantite,
-            "PU TTC": pu_ttc,
-            "TVA (%)": tva,
-            "PU HT": pu_ht,
-            "Total HT": total_ht_ligne,
-            "Montant TVA": montant_tva_ligne,
-            "Total TTC": total_ttc_ligne,
-        }
+    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=30)
+    response.raise_for_status()
+    result = response.json()
+
+    return result["invoice_number"]
+
+
+def build_pdf(data, line_items, logo_bytes=None):
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
     )
 
-    total_ht_general += total_ht_ligne
-    total_tva_general += montant_tva_ligne
-    total_ttc_general += total_ttc_ligne
+    styles = getSampleStyleSheet()
+    styles.add(
+        ParagraphStyle(
+            name="Small",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=11,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="TitleCustom",
+            parent=styles["Title"],
+            fontSize=20,
+            leading=24,
+            textColor=colors.HexColor("#222222"),
+            spaceAfter=8,
+        )
+    )
 
-st.subheader("Résumé")
-st.write(f"Total HT : {total_ht_general:.2f} €")
-st.write(f"TVA : {total_tva_general:.2f} €")
-st.write(f"Total TTC : {total_ttc_general:.2f} €")
-
-if lignes_calculees:
-    df_resume = pd.DataFrame(lignes_calculees)[
-        ["Description", "Quantité", "PU TTC", "TVA (%)", "PU HT", "Total HT", "Montant TVA", "Total TTC"]
-    ]
-    st.dataframe(df_resume, use_container_width=True)
-
-# =========================
-# PDF
-# =========================
-def generer_pdf(nom_fichier, numero, nom_client, adresse_client, date_facture, lignes_calculees,
-                total_ht_general, total_tva_general, total_ttc_general):
-
-    c = canvas.Canvas(nom_fichier, pagesize=A4)
-    largeur, hauteur = A4
+    story = []
 
     # Logo
-    if os.path.exists(LOGO_PATH):
-        logo = ImageReader(LOGO_PATH)
-        c.drawImage(logo, 40, hauteur - 100, width=120, height=60, mask='auto')
-
-    # Émetteur
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, hauteur - 130, EMETTEUR_NOM)
-
-    c.setFont("Helvetica", 10)
-    c.drawString(40, hauteur - 145, EMETTEUR_ADRESSE)
-    c.drawString(40, hauteur - 160, f"SIRET : {EMETTEUR_SIRET}")
+    if logo_bytes:
+        try:
+            img = ImageReader(io.BytesIO(logo_bytes))
+            iw, ih = img.getSize()
+            max_w = 45 * mm
+            scale = max_w / iw
+            story.append(
+                __import__("reportlab.platypus", fromlist=["Image"]).Image(
+                    io.BytesIO(logo_bytes),
+                    width=iw * scale,
+                    height=ih * scale,
+                )
+            )
+            story.append(Spacer(1, 6))
+        except Exception:
+            pass
 
     # Titre
-    c.setFont("Helvetica-Bold", 18)
-    c.drawString(400, hauteur - 130, "FACTURE")
+    story.append(Paragraph("FACTURE", styles["TitleCustom"]))
+    story.append(Spacer(1, 4))
 
-    # Numéro
-    c.setFont("Helvetica", 10)
-    c.drawString(400, hauteur - 150, f"N° : LK-{numero:03d}")
+    seller_address_html = data["seller_address"].replace("\n", "<br/>") if data["seller_address"] else ""
+    client_address_html = data["client_address"].replace("\n", "<br/>") if data["client_address"] else ""
 
-    # Client
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, hauteur - 220, "Client :")
+    left_block = f"""
+    <b>{data['seller_name']}</b><br/>
+    {seller_address_html}<br/>
+    SIRET : {data['seller_siret']}<br/>
+    """
 
-    c.setFont("Helvetica", 10)
-    c.drawString(40, hauteur - 235, nom_client)
+    client_block = f"""
+    <b>Client</b><br/>
+    {data['client_name']}<br/>
+    {client_address_html}
+    """
 
-    text = c.beginText(40, hauteur - 250)
-    for line in adresse_client.split("\n"):
-        text.textLine(line)
-    c.drawText(text)
+    meta_block = f"""
+    <b>Facture n° :</b> {data['invoice_number']}<br/>
+    <b>Date :</b> {data['invoice_date']}<br/>
+    <b>Échéance :</b> {data['due_date']}<br/>
+    """
 
-    # Date
-    c.drawString(400, hauteur - 220, f"Date : {date_facture}")
+    header_table = Table(
+        [
+            [
+                Paragraph(left_block, styles["Small"]),
+                Paragraph(client_block, styles["Small"]),
+                Paragraph(meta_block, styles["Small"]),
+            ]
+        ],
+        colWidths=[65 * mm, 65 * mm, 42 * mm],
+    )
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BOX", (0, 0), (-1, -1), 0.5, colors.white),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+    story.append(header_table)
+    story.append(Spacer(1, 10))
 
-    # Tableau
-    y = hauteur - 330
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(40, y, "Description")
-    c.drawString(250, y, "Qté")
-    c.drawString(290, y, "PU HT")
-    c.drawString(350, y, "TVA")
-    c.drawString(400, y, "Total HT")
-    c.drawString(470, y, "TTC")
+    # Tableau des lignes
+    table_data = [
+        ["Désignation", "Qté", "PU TTC", "TVA", "PU HT", "Total HT", "Total TTC"]
+    ]
 
-    y -= 15
-    c.line(40, y, 550, y)
-    y -= 15
+    total_ht = 0
+    total_tva = 0
+    total_ttc = 0
 
-    c.setFont("Helvetica", 9)
+    for item in line_items:
+        calc = compute_line_totals(item["qty"], item["unit_ttc"], item["tva_rate"])
+        total_ht += calc["total_ht"]
+        total_tva += calc["total_tva"]
+        total_ttc += calc["total_ttc"]
 
-    for ligne in lignes_calculees:
-        if y < 120:
-            c.showPage()
-            y = hauteur - 60
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(40, y, "Description")
-            c.drawString(250, y, "Qté")
-            c.drawString(290, y, "PU HT")
-            c.drawString(350, y, "TVA")
-            c.drawString(400, y, "Total HT")
-            c.drawString(470, y, "TTC")
-            y -= 15
-            c.line(40, y, 550, y)
-            y -= 15
-            c.setFont("Helvetica", 9)
+        table_data.append(
+            [
+                item["description"],
+                str(item["qty"]),
+                euro(item["unit_ttc"]),
+                f"{q2(item['tva_rate']):.2f} %",
+                euro(calc["unit_ht"]),
+                euro(calc["total_ht"]),
+                euro(calc["total_ttc"]),
+            ]
+        )
 
-        description = str(ligne["Description"])[:38]
-        c.drawString(40, y, description)
-        c.drawString(250, y, f'{ligne["Quantité"]:.0f}')
-        c.drawString(290, y, f'{ligne["PU HT"]:.2f} €')
-        c.drawString(350, y, f'{ligne["TVA (%)"]:.1f}%')
-        c.drawString(400, y, f'{ligne["Total HT"]:.2f} €')
-        c.drawString(470, y, f'{ligne["Total TTC"]:.2f} €')
-        y -= 18
+    items_table = Table(
+        table_data,
+        colWidths=[58 * mm, 16 * mm, 24 * mm, 18 * mm, 24 * mm, 24 * mm, 24 * mm],
+        repeatRows=1,
+    )
+    items_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAEAEA")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BBBBBB")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    story.append(items_table)
+    story.append(Spacer(1, 10))
 
     # Totaux
-    y -= 20
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(330, y, "Total HT :")
-    c.drawString(430, y, f"{total_ht_general:.2f} €")
+    totals_data = [
+        ["Total HT", euro(total_ht)],
+        ["TVA", euro(total_tva)],
+        ["Total TTC", euro(total_ttc)],
+    ]
 
-    y -= 18
-    c.drawString(330, y, "TVA :")
-    c.drawString(430, y, f"{total_tva_general:.2f} €")
-
-    y -= 18
-    c.drawString(330, y, "Total TTC :")
-    c.drawString(430, y, f"{total_ttc_general:.2f} €")
-
-    c.save()
-
-# =========================
-# BOUTON
-# =========================
-if st.button("Générer le PDF"):
-    if nom_client.strip() == "":
-        st.error("Veuillez renseigner le client.")
-    elif len(lignes_calculees) == 0:
-        st.error("Veuillez renseigner au moins une ligne de facture.")
-    else:
-        numero = get_next_invoice_number()
-        nom_fichier = os.path.join(
-            DOSSIER_FACTURES,
-            f"facture_LK_{numero:03d}.pdf"
+    totals_table = Table(totals_data, colWidths=[40 * mm, 30 * mm], hAlign="RIGHT")
+    totals_table.setStyle(
+        TableStyle(
+            [
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BBBBBB")),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
         )
+    )
+    story.append(totals_table)
+    story.append(Spacer(1, 12))
 
-        generer_pdf(
-            nom_fichier,
-            numero,
-            nom_client,
-            adresse_client,
-            str(date_facture),
-            lignes_calculees,
-            total_ht_general,
-            total_tva_general,
-            total_ttc_general
-        )
-
-        st.success(f"Facture créée : LK-{numero:03d}")
-
-        with open(nom_fichier, "rb") as f:
-            st.download_button(
-                "Télécharger la facture",
-                f,
-                file_name=f"facture_LK_{numero:03d}.pdf",
-                mime="application/pdf"
+    # Notes
+    if data["payment_terms"]:
+        story.append(
+            Paragraph(
+                f"<b>Conditions de paiement :</b> {data['payment_terms']}",
+                styles["Small"],
             )
+        )
+        story.append(Spacer(1, 4))
+
+    if data["notes"]:
+        notes_html = data["notes"].replace("\n", "<br/>")
+        story.append(
+            Paragraph(
+                f"<b>Notes :</b><br/>{notes_html}",
+                styles["Small"],
+            )
+        )
+
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+
+# =========================
+# SESSION STATE
+# =========================
+if "line_count" not in st.session_state:
+    st.session_state.line_count = 3
+
+
+# =========================
+# INTERFACE
+# =========================
+st.title("Facturation - L'Atelier Kez'ya")
+
+col_a, col_b = st.columns([2, 1])
+
+with col_a:
+    st.subheader("Informations facture")
+
+    st.text_input("Numéro de facture", value="Attribué automatiquement", disabled=True)
+    invoice_date = st.date_input("Date de facture", value=date.today())
+    due_date = st.date_input("Date d'échéance", value=date.today())
+
+    seller_name = st.text_input("Nom émetteur", value=DEFAULT_SELLER_NAME)
+    seller_address = st.text_area("Adresse émetteur", value=DEFAULT_SELLER_ADDRESS, height=80)
+    seller_siret = st.text_input("SIRET", value=DEFAULT_SELLER_SIRET)
+
+    client_name = st.text_input("Nom du client")
+    client_address = st.text_area("Adresse du client", height=80)
+
+with col_b:
+    st.subheader("PDF")
+    logo_file = st.file_uploader("Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
+    payment_terms = st.text_input("Conditions de paiement", value="Paiement à réception")
+    notes = st.text_area("Notes", height=120)
+
+st.markdown("---")
+st.subheader("Lignes de facture")
+
+btn1, btn2, _ = st.columns([1, 1, 4])
+with btn1:
+    if st.button("Ajouter une ligne"):
+        st.session_state.line_count += 1
+with btn2:
+    if st.button("Supprimer une ligne") and st.session_state.line_count > 1:
+        st.session_state.line_count -= 1
+
+line_items = []
+global_total_ht = 0
+global_total_tva = 0
+global_total_ttc = 0
+
+for i in range(st.session_state.line_count):
+    st.markdown(f"**Ligne {i + 1}**")
+    c1, c2, c3, c4 = st.columns([4, 1, 2, 1])
+
+    with c1:
+        description = st.text_input(
+            f"Désignation_{i}",
+            value="",
+            key=f"description_{i}",
+            label_visibility="collapsed",
+            placeholder="Désignation du produit ou service",
+        )
+    with c2:
+        qty = st.number_input(
+            f"Qté_{i}",
+            min_value=1,
+            value=1,
+            step=1,
+            key=f"qty_{i}",
+            label_visibility="collapsed",
+        )
+    with c3:
+        unit_ttc = st.number_input(
+            f"PU TTC_{i}",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            format="%.2f",
+            key=f"unit_ttc_{i}",
+            label_visibility="collapsed",
+        )
+    with c4:
+        tva_rate = st.number_input(
+            f"TVA_{i}",
+            min_value=0.0,
+            value=float(DEFAULT_TVA_RATE),
+            step=0.1,
+            format="%.2f",
+            key=f"tva_{i}",
+            label_visibility="collapsed",
+        )
+
+    calc = compute_line_totals(qty, unit_ttc, tva_rate)
+
+    c5, c6, c7 = st.columns(3)
+    c5.caption(f"PU HT : {euro(calc['unit_ht'])}")
+    c6.caption(f"Total HT : {euro(calc['total_ht'])}")
+    c7.caption(f"Total TTC : {euro(calc['total_ttc'])}")
+
+    if description.strip():
+        line_items.append(
+            {
+                "description": description.strip(),
+                "qty": qty,
+                "unit_ttc": unit_ttc,
+                "tva_rate": tva_rate,
+            }
+        )
+        global_total_ht += calc["total_ht"]
+        global_total_tva += calc["total_tva"]
+        global_total_ttc += calc["total_ttc"]
+
+st.markdown("---")
+st.subheader("Récapitulatif")
+
+r1, r2, r3 = st.columns(3)
+r1.metric("Total HT", euro(global_total_ht))
+r2.metric("TVA", euro(global_total_tva))
+r3.metric("Total TTC", euro(global_total_ttc))
+
+generate = st.button("Générer la facture PDF", type="primary")
+
+if generate:
+    if not client_name.strip():
+        st.error("Merci de renseigner le nom du client.")
+    elif not line_items:
+        st.error("Merci de renseigner au moins une ligne avec une désignation.")
+    else:
+        data = {
+            "invoice_number": "",
+            "invoice_date": invoice_date.strftime("%d/%m/%Y"),
+            "due_date": due_date.strftime("%d/%m/%Y"),
+            "seller_name": seller_name.strip(),
+            "seller_address": seller_address.strip(),
+            "seller_siret": seller_siret.strip(),
+            "client_name": client_name.strip(),
+            "client_address": client_address.strip(),
+            "payment_terms": payment_terms.strip(),
+            "notes": notes.strip(),
+        }
+
+        totals = {
+            "total_ht": global_total_ht,
+            "total_tva": global_total_tva,
+            "total_ttc": global_total_ttc,
+        }
+
+        try:
+            temp_filename = "facture_LK_temp.pdf"
+            invoice_number = get_invoice_number_and_save(data, line_items, totals, temp_filename)
+            data["invoice_number"] = invoice_number
+
+            filename = safe_filename(invoice_number)
+
+            logo_bytes = logo_file.getvalue() if logo_file else None
+            pdf_bytes = build_pdf(data, line_items, logo_bytes=logo_bytes)
+
+            with open(filename, "wb") as f:
+                f.write(pdf_bytes)
+
+            st.success(f"Facture générée : {filename}")
+
+            st.download_button(
+                label="Télécharger le PDF",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+            )
+
+        except Exception as e:
+            st.error(f"Erreur lors de l'enregistrement de la facture : {e}")
